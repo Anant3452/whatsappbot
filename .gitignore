@@ -1,0 +1,24 @@
+# Credentials and API keys
+.env
+
+# Dependencies
+node_modules/
+package-lock.json
+package-lock 2.json
+
+# Local databases and history
+history.json
+memory.json
+blacklist.json
+
+# WhatsApp session data
+.wwebjs_auth/
+.wwebjs_cache/
+auth_info_baileys/
+
+# Logs
+logs/
+*.log
+
+# System files
+.DS_Store
