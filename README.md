@@ -4,9 +4,9 @@ A sophisticated, personality-driven WhatsApp assistant powered by advanced LLMs 
 
 ## ✨ Features
 
-- **Brainy**: Powered by Llama 3 (via Groq), Gemini, and OpenRouter.
+- **Brainy**: Powered by Llama 3.3 (via Groq), Gemini, and OpenRouter.
 - **Personality**: Sophisticated J.A.R.V.I.S. persona (witty, helpful, and "Sir"-focused).
-- **Multimodal**: Handles text, images, stickers, and voice notes (transcribes voice on the fly!).
+- **Multimodal**: Handles text, images (Llama 3.2 Vision), stickers, and voice notes (transcribes voice on the fly!).
 - **Memory**: Remembers facts about you and global preferences.
 - **Tool Use**: Real-time web search, weather lookups, and system command execution.
 - **Dual Modes**: 
