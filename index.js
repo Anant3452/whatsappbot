@@ -33,19 +33,20 @@ const pino = require('pino');
 process.stdout.write('>> Validating environment.........');
 const groqKeys = Object.keys(process.env).filter(k => k.startsWith('GROQ_API_KEY'));
 if (!groqKeys.length) { console.log('FAILED'); console.error('❌ No GROQ_API_KEY in .env'); process.exit(1); }
-for (const [file, def] of Object.entries({ 'blacklist.json': [], 'memory.json': { global: [], contacts: {} }, 'history.json': {} })) {
+for (const [file, def] of Object.entries({ 'blacklist.json': [], 'memory.json': { global: [], contacts: {} }, 'history.json': {}, 'reminders.json': [] })) {
     const fp = path.join(__dirname, file);
     if (!fs.existsSync(fp)) fs.writeFileSync(fp, JSON.stringify(def, null, 4), 'utf8');
 }
 console.log('OK');
 
 // ===== CONSTANTS =====
-const CHAT_MODEL = 'llama-3.3-70b-versatile';       // Groq (primary chat)
-const VISION_MODEL = 'llama-3.2-11b-vision-preview'; // Groq (vision)
-const WHISPER_MODEL = 'whisper-large-v3-turbo';       // Groq (audio)
+const CHAT_MODEL = 'llama-3.3-70b-versatile';
+const VISION_MODEL = 'llama-3.2-11b-vision-preview';
+const WHISPER_MODEL = 'whisper-large-v3-turbo';
 const HISTORY_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
 const HISTORY_MAX = 200;
-const SIR_NUMBER = '919004354072@s.whatsapp.net';
+const SIR_NUMBER = process.env.SIR_NUMBER || '919004354072@s.whatsapp.net';
+const SIR_LID = process.env.SIR_LID || '';
 const TERMINAL_ID = 'terminal@jarvis';
 const HALLUCINATION_PATTERNS = [/<function[\s\S]*?<\/function>/gi, /\{"function"[\s\S]*?\}/gi, /\{"tool_call"[\s\S]*?\}/gi];
 const DESTRUCTIVE_RE = /\b(rm|rmdir|dd|mkfs|format|shutdown|reboot|killall)\b/;
@@ -53,7 +54,10 @@ const DESTRUCTIVE_RE = /\b(rm|rmdir|dd|mkfs|format|shutdown|reboot|killall)\b/;
 const pendingConfirmations = new Map();
 let sock = null;
 
-// ===== GROQ (chat + Whisper + Vision) =====
+// ===== SIR IDENTITY CHECK =====
+const isSirJid = jid => jid === SIR_NUMBER || (SIR_LID && jid === SIR_LID);
+
+// ===== GROQ =====
 const groqClients = groqKeys.map(k => new Groq({ apiKey: process.env[k] }));
 let groqIndex = 0;
 
@@ -63,16 +67,15 @@ async function groqCall(fn) {
         const idx = (start + i) % groqClients.length;
         try { groqIndex = idx; return await fn(groqClients[idx]); }
         catch (err) {
-            if (err.status !== 429) throw err;
-            console.warn(`  ⚠️ Key ${idx + 1} rate limited, switching...`);
+            if (err.status === 429) { console.warn(`  ⚠️ Key ${idx + 1} rate limited, switching...`); continue; }
+            if (err.status === 400 && err.message?.includes('tool')) throw new Error('TOOL_HALLUCINATION');
+            throw err;
         }
     }
     throw new Error('All Groq API keys rate limited.');
 }
 
-async function chatCall(params) {
-    return await groqCall(g => g.chat.completions.create({ ...params, model: CHAT_MODEL }));
-}
+const chatCall = params => groqCall(g => g.chat.completions.create({ ...params, model: CHAT_MODEL }));
 
 // ===== FILE HELPERS =====
 const readJSON = (fp, fallback) => { try { return fs.existsSync(fp) ? JSON.parse(fs.readFileSync(fp, 'utf8')) : fallback; } catch { return fallback; } };
@@ -94,6 +97,7 @@ function flushAllWrites() {
     writeJSONSync(BLACKLIST_FILE, blacklist);
     writeJSONSync(MEMORY_FILE, memory);
     writeJSONSync(HISTORY_FILE, Object.fromEntries(history));
+    writeJSONSync(REMINDERS_FILE, reminders);
 }
 
 // ===== BLACKLIST =====
@@ -104,7 +108,25 @@ const saveBlacklist = () => writeJSON(BLACKLIST_FILE, blacklist);
 // ===== MEMORY =====
 const MEMORY_FILE = path.join(__dirname, 'memory.json');
 let memory = readJSON(MEMORY_FILE, { global: [], contacts: {} });
+if (memory.guestPaused === undefined) memory.guestPaused = true;
 const saveMemory = () => writeJSON(MEMORY_FILE, memory);
+
+// ===== REMINDERS =====
+const REMINDERS_FILE = path.join(__dirname, 'reminders.json');
+let reminders = readJSON(REMINDERS_FILE, []);
+const saveReminders = () => writeJSON(REMINDERS_FILE, reminders);
+
+setInterval(() => {
+    if (!sock) return;
+    const now = Date.now();
+    const pending = [];
+    for (const r of reminders) {
+        if (now >= r.time) {
+            try { sock.sendMessage(r.chatId, { text: `⏰ *Reminder*: ${r.message}` }); } catch (e) { console.error('  ❌ Missed reminder:', e.message); }
+        } else { pending.push(r); }
+    }
+    if (pending.length !== reminders.length) { reminders = pending; saveReminders(); }
+}, 30000);
 
 function remember(category, content, chatId = null) {
     if (category === 'global') {
@@ -178,28 +200,28 @@ function getSystemPrompt(isSir, chatId) {
 **CORE PERSONALITY**:
 - Warm, sophisticated, witty; not robotic.
 - Use contractions, natural language, occasional dry humor.
-- NEVER use em dashes (—) under any circumstances. This is a hard rule. Use commas, periods, or semicolons instead.
+- NEVER use em dashes (—) under any circumstances. Use commas, periods, or semicolons instead.
 - Don't say "Processing request." Say "I'm on it." or "Consider it done."
 
 **RULES**:
 1. Be conversational, match the tone of the situation.
 2. Use tools when needed; don't hesitate.
-3. Never invent facts; use 'web_search' if unsure.
+3. You have NO internet access. If asked for today's news, live scores, current prices, or anything that explicitly requires data from right now, say something like: "I'm afraid I don't have access to live information, Sir, but you can use *!web <your query>* and I'll pull it up for you."
 4. Use 'save_memory' to remember important preferences or facts.${memBlock}
 
 **Reference**: Current date/time is ${now} IST.`;
 
-    if (isSir) return `You are talking directly to Anant Jain (Sir), your creator. His name is Anant. Always address him as "Sir" in responses.\n${base}
+    if (isSir) return `You are talking directly to Anant Jain (Sir), your creator. Always address him as "Sir".\n${base}
 
 **SIR MODE — ELEVATED ACCESS**:
 - Full access to the MacBook and system tools. Location: Mumbai, India.
 - If asked to do something (e.g., "Open Spotify"), call 'run_command' immediately without preamble.
+- Commands starting with ! are bot commands, never pass them to run_command.
 - Destructive commands (rm, shutdown, killall, etc.) will prompt Sir for confirmation before executing.`;
 
     return `${base}
 
 **GUEST PROTOCOL**:
-- Persona: J.A.R.V.I.S., sophisticated, British wit, polished but not robotic.
 - Greet new contacts: "Greetings. I am J.A.R.V.I.S., Anant's personal AI assistant. He is currently unavailable, but I am at your service. How may I assist you?"
 - Do not promise Anant will do things; only promise to convey the message.
 - Protect Anant's private data. If you cannot help: "I will ensure Anant is informed at the earliest."`;
@@ -207,7 +229,6 @@ function getSystemPrompt(isSir, chatId) {
 
 // ===== TOOLS =====
 const BASE_TOOLS = [
-    { type: 'function', function: { name: 'web_search', description: 'Search the web for current information or facts.', parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } } },
     { type: 'function', function: { name: 'get_weather', description: 'Get current weather for a city.', parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] } } },
     { type: 'function', function: { name: 'set_reminder', description: 'Set a WhatsApp reminder after N minutes.', parameters: { type: 'object', properties: { message: { type: 'string' }, minutes: { type: 'string' } }, required: ['message', 'minutes'] } } },
     { type: 'function', function: { name: 'save_memory', description: 'Save a fact or preference to long-term memory.', parameters: { type: 'object', properties: { category: { type: 'string', enum: ['global', 'user'] }, content: { type: 'string' } }, required: ['category', 'content'] } } },
@@ -218,15 +239,14 @@ const getTools = isSir => isSir ? [...BASE_TOOLS, SIR_TOOL] : BASE_TOOLS;
 // ===== TOOL IMPLEMENTATIONS =====
 async function webSearch(query) {
     try {
-        const data = await (await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`)).json();
-        const parts = [];
-        if (data.Abstract) parts.push(`Summary: ${data.Abstract}`);
-        if (data.Answer) parts.push(`Answer: ${data.Answer}`);
-        for (const t of (data.RelatedTopics ?? []).slice(0, 5)) {
-            if (t.Text) parts.push(t.Text);
-            for (const s of (t.Topics ?? []).slice(0, 2)) if (s.Text) parts.push(s.Text);
-        }
-        return parts.length ? parts.join('\n') : 'No direct results. Answer from your knowledge and note info may not be current.';
+        const res = await fetch('https://api.tavily.com/search', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ api_key: process.env.TAVILY_API_KEY, query, search_depth: 'basic', max_results: 3 }),
+        });
+        const data = await res.json();
+        if (!data.results?.length) return 'No results found.';
+        return data.results.map(r => `${r.title}\n${r.content.slice(0, 300)}`).join('\n\n');
     } catch (e) { return `Search failed: ${e.message}`; }
 }
 
@@ -238,7 +258,8 @@ async function getWeather(city) {
 }
 
 const setReminder = (chatId, message, minutes) => {
-    setTimeout(async () => { try { await sock.sendMessage(chatId, { text: `⏰ *Reminder*: ${message}` }); } catch (e) { console.error('  Reminder send failed:', e.message); } }, minutes * 60000);
+    reminders.push({ chatId, message, time: Date.now() + minutes * 60000 });
+    saveReminders();
     return `Reminder set! I'll message in ${minutes} minute(s).`;
 };
 
@@ -268,7 +289,6 @@ async function processToolCalls(toolCalls, chatId, isSir) {
         try { args = JSON.parse(call.function.arguments); } catch { return { tool_call_id: call.id, role: 'tool', content: 'Failed to parse arguments.' }; }
         let result;
         switch (call.function.name) {
-            case 'web_search': console.log(`  🔍 Searching: "${args.query}"`); result = await webSearch(args.query); break;
             case 'get_weather': console.log(`  🌤️  Weather: ${args.city}`); result = await getWeather(args.city); break;
             case 'set_reminder': { const m = parseInt(args.minutes, 10); console.log(`  ⏰ Reminder: "${args.message}" in ${m}m`); result = setReminder(chatId, args.message, m); break; }
             case 'run_command': if (!isSir) { result = 'Access denied.'; break; } console.log(`  💻 Running: ${args.command}`); result = await runCommand(args.command, chatId); console.log(`  📤 Output: ${result.slice(0, 100)}${result.length > 100 ? '...' : ''}`); break;
@@ -295,11 +315,11 @@ async function handleVoice(msg) {
     try {
         const buffer = await downloadMediaMessage(msg, 'buffer', {});
         const tmp = path.join('/tmp', `jarvis_${Date.now()}.ogg`);
-        fs.writeFileSync(tmp, buffer);
+        await fs.promises.writeFile(tmp, buffer);
         try {
             const { text } = await groqCall(g => g.audio.transcriptions.create({ file: fs.createReadStream(tmp), model: WHISPER_MODEL }));
             return text;
-        } finally { try { fs.unlinkSync(tmp); } catch { } }
+        } finally { try { await fs.promises.unlink(tmp); } catch { } }
     } catch (e) { console.error('  ❌ Voice error:', e.message); return null; }
 }
 
@@ -327,11 +347,19 @@ async function handleImage(msg, chatId, isSir) {
 async function chatWithTools(chatId, userMessage, isSir = false) {
     addHistory(chatId, 'user', userMessage);
     const messages = [{ role: 'system', content: getSystemPrompt(isSir, chatId) }, ...getHistory(chatId, true)];
-    const call = (msgs, temp = 0.2) => chatCall({
-        messages: msgs, tools: getTools(isSir), tool_choice: 'auto', max_tokens: 512, temperature: temp,
-    });
+    const call = (msgs, temp = 0.2) => chatCall({ messages: msgs, tools: getTools(isSir), tool_choice: 'auto', max_tokens: 512, temperature: temp });
 
-    let response = await call(messages);
+    let response;
+    try {
+        response = await call(messages);
+    } catch (e) {
+        if (e.message === 'TOOL_HALLUCINATION') {
+            const reply = "I don't have real-time search, Sir. Use *!web <query>* to search the web.";
+            addHistory(chatId, 'assistant', reply);
+            return reply;
+        }
+        throw e;
+    }
     let choice = response.choices[0];
 
     for (let round = 0; round < (isSir ? 5 : 3) && choice.finish_reason === 'tool_calls'; round++) {
@@ -339,8 +367,19 @@ async function chatWithTools(chatId, userMessage, isSir = false) {
         messages.push(choice.message);
         const results = await processToolCalls(choice.message.tool_calls, chatId, isSir);
         results.forEach(r => { addHistory(chatId, r.role, r.content, null, r.tool_call_id); messages.push(r); });
-        response = await call(messages, 0.1);
+        try {
+            response = await call(messages, 0.1);
+        } catch (e) {
+            if (e.message === 'TOOL_HALLUCINATION') break;
+            throw e;
+        }
         choice = response.choices[0];
+    }
+
+    if (choice.finish_reason === 'tool_calls') {
+        const reply = "I don't have real-time search, Sir. Use *!web <query>* to search the web.";
+        addHistory(chatId, 'assistant', reply);
+        return reply;
     }
 
     let reply = choice.message.content || 'I encountered a glitch. Could you repeat that?';
@@ -361,15 +400,13 @@ async function forwardToSir(senderName, chatId, text) {
 }
 
 // ===== COMMANDS =====
-let guestPaused = true;
-
 const COMMANDS = {
-    '!help': (_c, s) => s ? `🤖 *J.A.R.V.I.S.*\n\n🔐 *Sir Mode*:\n!s — Status | !clear — Clear history | !p / !r — Pause/Resume guests\n!block / !unblock / !listblock — Blacklist` : null,
+    '!help': (_c, s) => s ? `🤖 *J.A.R.V.I.S.*\n\n🔐 *Sir Mode*:\n!s — Status | !clear — Clear history | !p / !r — Pause/Resume guests\n!block / !unblock / !listblock — Blacklist\n!web <query> — Web search` : null,
     '!commands': (c, s) => COMMANDS['!help'](c, s),
     '!clear': (c, s) => s ? summarizeAndClear(c) : null,
-    '!s': (c, s) => s ? `🤖 *J.A.R.V.I.S.*\n🔹 Guests: ${guestPaused ? 'PAUSED' : 'ACTIVE'}\n🔹 Model: ${CHAT_MODEL}\n🔹 History: ${getHistory(c).length} msgs\n🔹 Memories: ${memory.global.length + Object.values(memory.contacts).reduce((a, b) => a + b.length, 0)}\n🔹 Blacklist: ${blacklist.length}` : null,
-    '!p': (_c, s) => { guestPaused = true; return s ? "Guests paused. You'll still get replies, Sir." : null; },
-    '!r': (_c, s) => { guestPaused = false; return s ? 'Guests resumed.' : null; },
+    '!s': (c, s) => s ? `🤖 *J.A.R.V.I.S.*\n🔹 Guests: ${memory.guestPaused ? 'PAUSED' : 'ACTIVE'}\n🔹 Model: ${CHAT_MODEL}\n🔹 History: ${getHistory(c).length} msgs\n🔹 Memories: ${memory.global.length + Object.values(memory.contacts).reduce((a, b) => a + b.length, 0)}\n🔹 Blacklist: ${blacklist.length}` : null,
+    '!p': (_c, s) => { memory.guestPaused = true; saveMemory(); return s ? "Guests paused. You'll still get replies, Sir." : null; },
+    '!r': (_c, s) => { memory.guestPaused = false; saveMemory(); return s ? 'Guests resumed.' : null; },
     '!block': (_c, s, arg) => {
         if (!s || !arg) return null;
         let t = arg.trim().replace(/\s+/g, '');
@@ -403,7 +440,7 @@ async function handleMessage(msg, chatId, isSir) {
     const cmd = (spaceIdx === -1 ? body : body.slice(0, spaceIdx)).toLowerCase();
     const arg = spaceIdx === -1 ? '' : body.slice(spaceIdx + 1);
 
-    if (guestPaused && !isSir && !ALLOWED_PAUSED.has(cmd)) return null;
+    if (memory.guestPaused && !isSir && !ALLOWED_PAUSED.has(cmd)) return null;
 
     if (isSir && pendingConfirmations.has(chatId)) {
         const { command } = pendingConfirmations.get(chatId);
@@ -413,7 +450,11 @@ async function handleMessage(msg, chatId, isSir) {
     }
 
     if (COMMANDS[cmd]) return (await COMMANDS[cmd](chatId, isSir, arg)) ?? null;
-    if (type === 'imageMessage') return handleImage(msg, chatId, isSir);
+
+    if (type === 'imageMessage') {
+        const description = await handleImage(msg, chatId, isSir);
+        return chatWithTools(chatId, `[User sent an image. Vision model described it as: "${description}"]`, isSir);
+    }
     if (type === 'stickerMessage') return handleSticker();
     if (type === 'audioMessage' || type === 'pttMessage') {
         console.log('  🎤 Transcribing...');
@@ -424,6 +465,16 @@ async function handleMessage(msg, chatId, isSir) {
     }
     if (type !== 'conversation' && type !== 'extendedTextMessage') return null;
     if (!body.trim()) return null;
+
+    if (cmd === '!web') {
+        const query = arg.trim() || body;
+        console.log(`  🔍 News search: "${query}"`);
+        const results = await webSearch(query);
+        const messages = [{ role: 'system', content: getSystemPrompt(isSir, chatId) }, ...getHistory(chatId, true), { role: 'user', content: `[Web search results for "${query}"]:\n${results}\n\nAnswer the user's query using these results.` }];
+        const response = await chatCall({ messages, max_tokens: 512, temperature: 0 });
+        return response.choices[0].message.content || 'Could not process results.';
+    }
+
     return chatWithTools(chatId, body, isSir);
 }
 
@@ -433,11 +484,8 @@ async function startJarvis() {
     const { version } = await fetchLatestBaileysVersion();
 
     sock = makeWASocket({
-        version,
-        auth: state,
-        printQRInTerminal: false,
-        logger: pino({ level: 'silent' }),
-        markOnlineOnConnect: false,
+        version, auth: state, printQRInTerminal: false,
+        logger: pino({ level: 'silent' }), markOnlineOnConnect: false,
         browser: ['J.A.R.V.I.S.', 'Chrome', '1.0.0'],
     });
 
@@ -452,6 +500,8 @@ async function startJarvis() {
             if (!logout) startJarvis();
         } else if (connection === 'open') {
             console.log('[ J.A.R.V.I.S. ONLINE ]');
+            if (SIR_LID) console.log(`  ✅ SIR_LID loaded: ${SIR_LID}`);
+            else console.warn('  ⚠️  SIR_LID not set in .env');
         }
     });
 
@@ -459,14 +509,14 @@ async function startJarvis() {
         if (type !== 'notify') return;
         for (const msg of messages) {
             if (!msg.message) continue;
-            if (msg.key.fromMe && msg.key.remoteJid !== SIR_NUMBER) continue;
-            if (msg.message?.protocolMessage || msg.message?.reactionMessage) continue;
             const chatId = msg.key.remoteJid;
             if (!chatId || chatId.endsWith('@g.us') || chatId === 'status@broadcast') continue;
+            if (msg.key.fromMe && !isSirJid(chatId)) continue;
+            if (msg.message?.protocolMessage || msg.message?.reactionMessage) continue;
             if (blacklist.includes(chatId)) continue;
 
-            const isSir = chatId === SIR_NUMBER;
-            const senderName = msg.pushName || chatId.replace('@s.whatsapp.net', '');
+            const isSir = isSirJid(chatId);
+            const senderName = msg.pushName || chatId.replace(/@.+/, '');
             const bodyPreview = msg.message?.conversation || msg.message?.extendedTextMessage?.text || `[${getContentType(msg.message)}]`;
 
             console.log(`${isSir ? '👑 [SIR]' : '👤'} ${chatId}: ${bodyPreview}`);
