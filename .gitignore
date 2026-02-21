@@ -9,6 +9,10 @@ package-lock 2.json
 history.json
 memory.json
 blacklist.json
+reminders.json
+
+# Atomic-write backups
+*.bak
 
 # WhatsApp session data
 .wwebjs_auth/

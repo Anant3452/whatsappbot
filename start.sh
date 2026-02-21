@@ -1,7 +1,7 @@
 #!/bin/bash
 # J.A.R.V.I.S. Launcher
 
-DIR="/Users/anant/Documents/whatsappbot"
+DIR="$( cd "$(dirname "$0")" && pwd )"
 
 cd "$DIR" || { echo "❌ Could not cd into $DIR"; exit 1; }
 
